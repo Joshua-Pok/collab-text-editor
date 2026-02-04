@@ -132,6 +132,14 @@ func handleBroadcast() { //broadcasts messages for clients in their send channel
 func main() {
 
 	http.HandleFunc("/ws", wsHandler)
+	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	})
+	http.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ready"))
+	})
 	go handleBroadcast()
 	fmt.Println("Websocket server started on port:8080")
 	err := http.ListenAndServe(":8080", nil)
