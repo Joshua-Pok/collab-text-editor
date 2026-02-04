@@ -1,16 +1,30 @@
 services:
   postgres:
     image: postgres:16
+    container_name: collab-postgres
+    restart: unless-stopped
     environment:
-      POSTGRES_USER: joshua
-      POSTGRES_PASSWORD: rcr13121
-      POSTGRES_DB: text_editor_db
+      POSTGRES_USER: collab
+      POSTGRES_PASSWORD: collabpass
+      POSTGRES_DB: collabdb
     ports:
-     - "5432:5432"
-
+      - "55432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
 
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: collab-rabbitmq
+    restart: unless-stopped
+    ports:
+      - "5672:5672"    # AMQP
+      - "15672:15672"  # Management UI
+    environment:
+      RABBITMQ_DEFAULT_USER: collab
+      RABBITMQ_DEFAULT_PASS: collabpass
+    volumes:
+      - rabbitdata:/var/lib/rabbitmq
 
 volumes:
   pgdata:
+  rabbitdata:

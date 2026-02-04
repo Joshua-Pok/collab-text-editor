@@ -1,18 +1,12 @@
 package main
 
 import (
-	"context"
-	"encoding/base64"
-	"encoding/json"
 	"fmt"
-	"log"
+	"github.com/gorilla/websocket"
+	"net/http"
 	"os"
 	"strings"
-	"time"
-
-	"github.com/eclipse/paho.mqtt.golang"
-	"github.com/jackc/pgx"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"sync"
 )
 
 type UpdateMessage struct {
@@ -50,70 +44,65 @@ func parseDocID(topic string) (string, bool) {
 	return parts[1], true
 }
 
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		return true
+	},
+}
+
+var clients = make(map[*websocket.Conn]bool) //client: connected?
+var broadcast = make(chan []byte)            //broadcast channel
+var mutex = &sync.Mutex{}                    // protect clients map
+
+func wsHandler(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil) // upgrade http request to ws
+	if err != nil {
+		fmt.Println("Unable to upgrade http connection", err)
+		return
+
+	}
+
+	defer conn.Close()
+
+	mutex.Lock() //any other go routine that uses this mutex must wait here
+	clients[conn] = true
+	mutex.Unlock()
+
+	for {
+		_, message, err := conn.ReadMessage()
+		if err != nil {
+			mutex.Lock()
+			delete(clients, conn)
+			mutex.Unlock()
+			break
+		}
+		broadcast <- message // put message in the broadcast channel
+	}
+}
+
+func handleBroadcast() {
+	for {
+		message := <-broadcast //grab next message from broadcast
+
+		mutex.Lock()
+		for client := range clients {
+			err := client.WriteMessage(websocket.TextMessage, message)
+			if err != nil {
+				client.Close()
+				delete(clients, client)
+			}
+		}
+		mutex.Unlock()
+	}
+}
 func main() {
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	pgURL := getEnv("DATABASE_URL", "postgres://collab:collabpass@localhost:5432/collabdb")
-	mqttURL := getEnv("MQTT_URL", "tcp://localhost:1883")
-	topic := getEnv("MQTT_TOPIC", "doc/+/updates") //wildcard subscribe
-
-	pool, err := pgxpool.New(ctx, pgURL) //pool of postgres connections, important for concurrent backends because multiple writes may happen simultaenously
+	http.HandleFunc("/ws", wsHandler)
+	go handleBroadcast()
+	fmt.Println("Websocket server started on port:8080")
+	err := http.ListenAndServe(":8080", nil)
 	if err != nil {
-		log.Fatalf("Error creating pg pool: %v", err)
+		fmt.Println("Error starting websocket server")
 	}
-
-	defer pool.Close()
-
-	opts := mqtt.NewClientOptions().
-		AddBroker(mqttURL).
-		SetClientID(fmt.Sprintf("persist-%d", time.Now().UnixNano())).
-		SetAutoReconnect(true).
-		SetConnectRetry(true).
-		SetConnectRetryInterval(2 * time.Second)
-
-	client := mqtt.NewClient(opts)
-	if token := client.Connect(); token.Wait() && token.Error() != nil {
-		log.Fatalf("mqtt connect: %v", token.Error())
-	}
-
-	fmt.Print("MQTT connection established")
-
-	subscribeHandler := func(_ mqtt.Client, msg mqtt.Message) {
-		docID, ok := parseDocID(string(msg.Topic()))
-		if !ok {
-			log.Printf("Skipping topic %s: cannot parse doc id", msg.Topic())
-			return
-		}
-
-		var m UpdateMessage
-		if err := json.Unmarshal(msg.Payload(), &m); err != nil {
-			log.Printf("bad topic")
-		}
-
-		updateBytes, err := base64.StdEncoding.DecodeString(m.UpdateB64) //convert to bytes
-
-		if err != nil {
-			log.Printf("bad topic")
-		}
-
-		_, err = pool.Exec(context.Background(), `INSERT into doc_updates (doc_id, client_id, update_bytes) VALUES ($1, $2, $3)`, docID, m.ClientID, updateBytes)
-
-		if err != nil {
-			log.Printf("db insert failed doc=%s, err=%v", docID, err)
-		}
-
-	}
-
-	if token := client.Subscribe(topic, 1, subscribeHandler); token.Wait() && token.Error() != nil {
-		log.Fatalf("MQTT subscribe: %v", token.Error())
-	}
-	log.Printf("Subscribe to %s (qos=1)\n", topic)
-
-	sigc := make(chan os.Signal, 1)
-	signal.Notify(sigc, syscall.SIGINT, syscall.SIGTERM)
-	<-sigc
-	log.Println("Shutting Down...")
 
 }
