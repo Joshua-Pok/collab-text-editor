@@ -1,11 +1,10 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"github.com/gorilla/websocket"
 	"net/http"
-	"os"
-	"strings"
 	"sync"
 )
 
@@ -15,44 +14,63 @@ type UpdateMessage struct {
 	TS        int64  `json:"ts"`
 }
 
-func getEnv(k, def string) string {
-	v := os.Getenv(k)
-	if v == "" {
-		return def
-	}
-
-	return v
-}
-
-func parseDocID(topic string) (string, bool) {
-	//expected: doc/{docID}/updates
-
-	parts := strings.Split(topic, "/")
-
-	if len(parts) != 3 {
-		return "", false
-	}
-
-	if parts[0] != "doc" || parts[2] != "updates" {
-		return "", false
-	}
-
-	if parts[1] == "" {
-		return "", false
-	}
-
-	return parts[1], true
-}
-
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
 		return true
 	},
 }
 
-var clients = make(map[*websocket.Conn]bool) //client: connected?
-var broadcast = make(chan []byte)            //broadcast channel
-var mutex = &sync.Mutex{}                    // protect clients map
+var (
+	clients   = make(map[string]*Client)
+	mutex     = &sync.Mutex{}
+	broadcast = make(chan *UpdateMessage)
+)
+
+type Client struct {
+	conn     *websocket.Conn
+	clientID string
+	send     chan []byte //each client needs a channel for fan out pattenr, if not each message would only go to one client
+}
+
+func (c *Client) readPump() {
+	defer func() { //cleanup function
+		mutex.Lock()
+		delete(clients, c.clientID)
+		mutex.Unlock()
+		c.conn.Close()
+		fmt.Printf("Client %s disconnected!", c.clientID)
+	}()
+
+	for {
+		_, message, err := c.conn.ReadMessage()
+		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				fmt.Printf("Websocket error: %v\n", err)
+			}
+			break
+		}
+
+		var updateMsg UpdateMessage
+		if err := json.Unmarshal(message, &updateMsg); err != nil {
+			fmt.Printf("Error unmarshalling message: %v\n", err)
+			continue
+		}
+
+		broadcast <- &updateMsg
+
+	}
+}
+
+func (c *Client) writePump() {
+	defer c.conn.Close()
+	for message := range c.send {
+		if err := c.conn.WriteMessage(websocket.TextMessage, message); err != nil {
+			fmt.Printf("Error writing message: %v\n", err)
+			return
+		}
+	}
+
+}
 
 func wsHandler(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil) // upgrade http request to ws
@@ -64,32 +82,48 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 
 	defer conn.Close()
 
-	mutex.Lock() //any other go routine that uses this mutex must wait here
-	clients[conn] = true
+	clientID := r.URL.Query().Get("clientId") //request still comes in as http first before being upgraded so we can still get stuff from the url
+	if clientID == "" {
+		fmt.Println("Client has no clientid")
+		conn.Close()
+		return
+	}
+
+	client := &Client{
+		conn:     conn,
+		clientID: clientID,
+		send:     make(chan []byte, 256),
+	}
+
+	mutex.Lock()
+	clients[clientID] = client
 	mutex.Unlock()
 
-	for {
-		_, message, err := conn.ReadMessage()
-		if err != nil {
-			mutex.Lock()
-			delete(clients, conn)
-			mutex.Unlock()
-			break
-		}
-		broadcast <- message // put message in the broadcast channel
-	}
+	go client.readPump()
+	go client.writePump()
+
 }
 
-func handleBroadcast() {
+func handleBroadcast() { //broadcasts messages for clients in their send channel
 	for {
-		message := <-broadcast //grab next message from broadcast
+		UpdateMessage := <-broadcast //grab next message from broadcast
+
+		message, err := json.Marshal(UpdateMessage)
+		if err != nil {
+			fmt.Printf("Error marshalling broadcast msg: %s", err)
+			continue //skip this message
+		}
 
 		mutex.Lock()
-		for client := range clients {
-			err := client.WriteMessage(websocket.TextMessage, message)
-			if err != nil {
-				client.Close()
-				delete(clients, client)
+		for id, client := range clients {
+			if id != UpdateMessage.ClientID {
+				select { //waits on multiple channel operations
+				case client.send <- message: //puts the message in clients send channels
+				default:
+					//client's send buffer is full, close the connection
+					close(client.send)
+					delete(clients, id)
+				}
 			}
 		}
 		mutex.Unlock()
